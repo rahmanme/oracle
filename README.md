@@ -16,14 +16,14 @@ GORM Oracle driver for connect Oracle DB and Manage Oracle DB, Based on [stevefa
 ## Quick Start
 ### how to install 
 ```bash
-go get github.com/cengsin/oracle
+go get github.com/rahmanme/oracle
 ```
 ###  usage
 
 ```go
 import (
 	"fmt"
-	"github.com/cengsin/oracle"
+	"github.com/rahmanme/oracle"
 	"gorm.io/gorm"
 	"log"
 )
