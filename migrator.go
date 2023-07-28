@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"fmt"
+	"gorm.io/gorm/schema"
 	"strings"
 
 	"gorm.io/gorm"
@@ -85,61 +86,6 @@ func (m Migrator) RenameTable(oldName, newName interface{}) (err error) {
 		clause.Table{Name: oldTable},
 		clause.Table{Name: newTable},
 	).Error
-}
-
-func (m Migrator) AddColumn(value interface{}, field string) error {
-	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		if field := stmt.Schema.LookUpField(field); field != nil {
-			return m.DB.Exec(
-				"ALTER TABLE ? ADD ? ?",
-				clause.Table{Name: stmt.Table}, clause.Column{Name: field.DBName}, m.DB.Migrator().FullDataTypeOf(field),
-			).Error
-		}
-		return fmt.Errorf("failed to look up field with name: %s", field)
-	})
-}
-
-func (m Migrator) DropColumn(value interface{}, name string) error {
-	if !m.HasColumn(value, name) {
-		return nil
-	}
-
-	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		if field := stmt.Schema.LookUpField(name); field != nil {
-			name = field.DBName
-		}
-
-		return m.DB.Exec(
-			"ALTER TABLE ? DROP ?",
-			clause.Table{Name: stmt.Table},
-			clause.Column{Name: name},
-		).Error
-	})
-}
-
-func (m Migrator) AlterColumn(value interface{}, field string) error {
-	if !m.HasColumn(value, field) {
-		return nil
-	}
-
-	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		if field := stmt.Schema.LookUpField(field); field != nil {
-			return m.DB.Exec(
-				"ALTER TABLE ? MODIFY ? ?",
-				clause.Table{Name: stmt.Table},
-				clause.Column{Name: field.DBName},
-				m.FullDataTypeOf(field),
-			).Error
-		}
-		return fmt.Errorf("failed to look up field with name: %s", field)
-	})
-}
-
-func (m Migrator) HasColumn(value interface{}, field string) bool {
-	var count int64
-	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		return m.DB.Raw("SELECT COUNT(*) FROM USER_TAB_COLUMNS WHERE TABLE_NAME = ? AND COLUMN_NAME = ?", stmt.Table, field).Row().Scan(&count)
-	}) == nil && count > 0
 }
 
 func (m Migrator) CreateConstraint(value interface{}, name string) error {
@@ -250,3 +196,143 @@ func (m Migrator) TryQuotifyReservedWords(values ...interface{}) error {
 	}
 	return nil
 }
+
+func (m Migrator) CurrentSchema(stmt *gorm.Statement, table string) (interface{}, interface{}) {
+	if strings.Contains(table, ".") {
+		if tables := strings.Split(table, `.`); len(tables) == 2 {
+			return tables[0], tables[1]
+		}
+	}
+
+	if stmt.TableExpr != nil {
+		if tables := strings.Split(stmt.TableExpr.SQL, `"."`); len(tables) == 2 {
+			return strings.TrimPrefix(tables[0], `"`), table
+		}
+	}
+	return clause.Expr{SQL: "sys_context( 'userenv', 'current_schema' )"}, table
+}
+
+func (m Migrator) CreateSequence(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field,
+	serialDatabaseType string) (err error) {
+
+	_, table := m.CurrentSchema(stmt, stmt.Table)
+	tableName := table.(string)
+
+	sequenceName := strings.Join([]string{tableName, field.DBName, "seq"}, "_")
+	if err = tx.Exec(`CREATE SEQUENCE IF NOT EXISTS ? AS ?`, clause.Expr{SQL: sequenceName},
+		clause.Expr{SQL: serialDatabaseType}).Error; err != nil {
+		return err
+	}
+
+	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? SET DEFAULT nextval('?')",
+		clause.Expr{SQL: tableName}, clause.Expr{SQL: field.DBName}, clause.Expr{SQL: sequenceName}).Error; err != nil {
+		return err
+	}
+
+	if err := tx.Exec("ALTER SEQUENCE ? OWNED BY ?.?",
+		clause.Expr{SQL: sequenceName}, clause.Expr{SQL: tableName}, clause.Expr{SQL: field.DBName}).Error; err != nil {
+		return err
+	}
+	return
+}
+
+func (m Migrator) UpdateSequence(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field,
+	serialDatabaseType string) (err error) {
+
+	sequenceName, err := m.getColumnSequenceName(tx, stmt, field)
+	if err != nil {
+		return err
+	}
+
+	if err = tx.Exec(`ALTER SEQUENCE IF EXISTS ? AS ?`, clause.Expr{SQL: sequenceName}, clause.Expr{SQL: serialDatabaseType}).Error; err != nil {
+		return err
+	}
+
+	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? TYPE ?",
+		m.CurrentTable(stmt), clause.Expr{SQL: field.DBName}, clause.Expr{SQL: serialDatabaseType}).Error; err != nil {
+		return err
+	}
+	return
+}
+
+func (m Migrator) DeleteSequence(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field,
+	fileType clause.Expr) (err error) {
+
+	sequenceName, err := m.getColumnSequenceName(tx, stmt, field)
+	if err != nil {
+		return err
+	}
+
+	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? TYPE ?", m.CurrentTable(stmt), clause.Column{Name: field.DBName}, fileType).Error; err != nil {
+		return err
+	}
+
+	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? DROP DEFAULT",
+		m.CurrentTable(stmt), clause.Expr{SQL: field.DBName}).Error; err != nil {
+		return err
+	}
+
+	if err = tx.Exec(`DROP SEQUENCE IF EXISTS ?`, clause.Expr{SQL: sequenceName}).Error; err != nil {
+		return err
+	}
+
+	return
+}
+
+func (m Migrator) getColumnSequenceName(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field) (
+	sequenceName string, err error) {
+	_, table := m.CurrentSchema(stmt, stmt.Table)
+
+	// DefaultValueValue is reset by ColumnTypes, search again.
+	var columnDefault string
+	err = tx.Raw(
+		`SELECT column_default FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
+		table, field.DBName).Scan(&columnDefault).Error
+
+	if err != nil {
+		return
+	}
+
+	sequenceName = strings.TrimSuffix(
+		strings.TrimPrefix(columnDefault, `nextval('`),
+		`'::regclass)`,
+	)
+	return
+}
+
+func getSerialDatabaseType(s string) (dbType string, ok bool) {
+	switch s {
+	case "smallserial":
+		return "integer", true
+	case "serial":
+		return "integer", true
+	case "bigserial":
+		return "number", true
+	default:
+		return "", false
+	}
+}
+
+func (m Migrator) resetPreparedStmts() {
+	if m.DB.PrepareStmt {
+		if pdb, ok := m.DB.ConnPool.(*gorm.PreparedStmtDB); ok {
+			pdb.Reset()
+		}
+	}
+}
+
+//func (m Migrator) GetRows(currentSchema interface{}, table interface{}) (*sql.Rows, error) {
+//	name := table.(string)
+//	if _, ok := currentSchema.(string); ok {
+//		name = fmt.Sprintf("%v.%v", currentSchema, table)
+//	}
+//
+//	return m.DB.Session(&gorm.Session{}).Table(name).Limit(1).Scopes(func(d *gorm.DB) *gorm.DB {
+//		//dialector, _ := m.Dialector.(Dialector)
+//		// use simple protocol
+//		//if !m.DB.PrepareStmt && (dialector.Config != nil && (dialector.Config.DriverName == "" || dialector.Config.DriverName == "godror")) {
+//		//	d.Statement.Vars = append([]interface{}{godror.QueryExecModeSimpleProtocol}, d.Statement.Vars...)
+//		//}
+//		return d
+//	}).Rows()
+//}
